@@ -18,6 +18,102 @@ async function main() {
     console.log("✅ PredictionMarketDAO deployed to:", daoAddress);
     console.log("✅ GovernanceToken deployed to:", govTokenAddress);
 
+    // Get contracts
+    await hre.network.provider.send("hardhat_setBalance", [
+        daoAddress,
+        "0x56BC75E2D63100000", // 100 ETH in hex
+    ]);
+    console.log("💰 Distributing GOV tokens...");
+    const govToken = await hre.ethers.getContractAt("GovernanceToken", govTokenAddress);
+    const [owner, alice, bob, charlie] = await hre.ethers.getSigners();
+    await ethers.provider.send("hardhat_impersonateAccount", [daoAddress]);
+    const daoSigner = await ethers.getSigner(daoAddress);
+
+    // Owner balance
+    const ownerGovBalance = await govToken.balanceOf(owner.address);
+    const ownerEthBalance = await hre.ethers.provider.getBalance(owner.address);
+
+    // DAO contract balance
+    const daoGovBalance = await govToken.balanceOf(daoAddress);
+    const daoEthBalance = await hre.ethers.provider.getBalance(daoAddress);
+
+    // GovernanceToken contract balance
+    const govContractGovBalance = await govToken.balanceOf(govTokenAddress);
+    const govContractEthBalance = await hre.ethers.provider.getBalance(govTokenAddress);
+
+    // ========================================
+    // 💧 ADD LIQUIDITY TO GOV TOKEN CONTRACT
+    // ========================================
+    console.log("\n💧 ADDING LIQUIDITY TO GOV TOKEN CONTRACT...");
+    
+    const liquidityAmount = hre.ethers.parseEther("8000000"); // 8M GOV
+    const ethLiquidity = hre.ethers.parseEther("1000"); // 1000 ETH
+
+    // Transfer GOV tokens to contract
+    console.log("  Transferring", hre.ethers.formatEther(liquidityAmount), "GOV to contract...");
+    const transferTx = await govToken.connect(daoSigner).transfer(govTokenAddress, liquidityAmount);
+    await transferTx.wait();
+
+    // Send ETH to contract
+    console.log("  Sending", hre.ethers.formatEther(ethLiquidity), "ETH to contract...");
+    const fundTx = await owner.sendTransaction({
+        to: govTokenAddress,
+        value: ethLiquidity,
+    });
+    await fundTx.wait();
+
+    console.log("✅ Liquidity added!");
+
+    // ========================================
+    // 📊 CHECK BALANCES AFTER LIQUIDITY
+    // ========================================
+    console.log("\n📊 BALANCES AFTER ADDING LIQUIDITY:");
+    console.log("=" .repeat(60));
+
+    const ownerGovBalanceAfter = await govToken.balanceOf(owner.address);
+    const ownerEthBalanceAfter = await hre.ethers.provider.getBalance(owner.address);
+    console.log("\n👑 OWNER:", owner.address);
+    console.log("  GOV:", hre.ethers.formatEther(ownerGovBalanceAfter), 
+        `(${ownerGovBalance > ownerGovBalanceAfter ? '-' : '+'}${hre.ethers.formatEther(ownerGovBalance - ownerGovBalanceAfter)})`);
+    console.log("  ETH:", hre.ethers.formatEther(ownerEthBalanceAfter));
+
+    const govContractGovBalanceAfter = await govToken.balanceOf(govTokenAddress);
+    const govContractEthBalanceAfter = await hre.ethers.provider.getBalance(govTokenAddress);
+    console.log("\n💰 GOV TOKEN CONTRACT:", govTokenAddress);
+    console.log("  GOV:", hre.ethers.formatEther(govContractGovBalanceAfter), 
+        `(+${hre.ethers.formatEther(govContractGovBalanceAfter - govContractGovBalance)})`);
+    console.log("  ETH:", hre.ethers.formatEther(govContractEthBalanceAfter), 
+        `(+${hre.ethers.formatEther(govContractEthBalanceAfter - govContractEthBalance)})`);
+
+    console.log("=" .repeat(60));
+
+    // ========================================
+    // 📊 FINAL BALANCES
+    // ========================================
+    console.log("\n📊 FINAL BALANCES:");
+    console.log("=" .repeat(60));
+
+    const ownerGovFinal = await govToken.balanceOf(owner.address);
+    const ownerEthFinal = await hre.ethers.provider.getBalance(owner.address);
+    console.log("\n👑 OWNER:", owner.address);
+    console.log("  GOV:", hre.ethers.formatEther(ownerGovFinal));
+    console.log("  ETH:", hre.ethers.formatEther(ownerEthFinal));
+
+    const govContractGovFinal = await govToken.balanceOf(govTokenAddress);
+    const govContractEthFinal = await hre.ethers.provider.getBalance(govTokenAddress);
+    console.log("\n💰 GOV TOKEN CONTRACT:", govTokenAddress);
+    console.log("  GOV:", hre.ethers.formatEther(govContractGovFinal));
+    console.log("  ETH:", hre.ethers.formatEther(govContractEthFinal));
+
+    const daoGovFinal = await govToken.balanceOf(daoAddress);
+    const daoEthFinal = await hre.ethers.provider.getBalance(daoAddress);
+    console.log("\n🏛️  DAO CONTRACT:", daoAddress);
+    console.log("  GOV:", hre.ethers.formatEther(daoGovFinal));
+    console.log("  ETH:", hre.ethers.formatEther(daoEthFinal));
+
+    console.log("\n📈 TOTAL SUPPLY:", hre.ethers.formatEther(await govToken.totalSupply()));
+    console.log("=" .repeat(60));
+
     // Save addresses to frontend
     const addresses = {
         localhost: {
@@ -37,26 +133,6 @@ async function main() {
 
     fs.writeFileSync(configPath, configContent);
     console.log("✅ Updated contract addresses in frontend\n");
-
-    // Setup initial distribution (optional)
-    const [owner, alice, bob, charlie] = await hre.ethers.getSigners();
-
-    const govToken = await hre.ethers.getContractAt("GovernanceToken", govTokenAddress);
-    await hre.network.provider.send("hardhat_setBalance", [
-        daoAddress,
-        "0x56BC75E2D63100000", // 100 ETH in hex
-    ]);
-    console.log("💰 Distributing GOV tokens...");
-
-    await ethers.provider.send("hardhat_impersonateAccount", [daoAddress]);
-    const daoSigner = await ethers.getSigner(daoAddress);
-    // Transfer GOV to test accounts
-    await govToken.connect(daoSigner).transfer(alice.address, hre.ethers.parseEther("1000"));
-    await govToken.connect(daoSigner).transfer(bob.address, hre.ethers.parseEther("1000"));
-    await govToken.connect(daoSigner).transfer(charlie.address, hre.ethers.parseEther("1000"));
-    console.log("✅ Alice:", hre.ethers.formatEther(await govToken.balanceOf(alice.address)), "GOV");
-    console.log("✅ Bob:", hre.ethers.formatEther(await govToken.balanceOf(bob.address)), "GOV");
-    console.log("✅ Charlie:", hre.ethers.formatEther(await govToken.balanceOf(charlie.address)), "GOV");
 
     console.log("\n🎉 Deployment completed!");
     console.log("\n📋 Summary:");
