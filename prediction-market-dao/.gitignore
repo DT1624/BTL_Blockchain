@@ -2,3 +2,4 @@ node_modules/
 artifacts/
 cache/
 bin/
+frontend/node_modules/

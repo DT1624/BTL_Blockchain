@@ -1,25 +1,35 @@
-const fs = require("fs");
-const path = require("path");
+const fs = require('fs');
+const path = require('path');
 
-// Đường dẫn file artifact Hardhat
-const artifactPath = path.join(
-  __dirname,
-  "../artifacts/contracts/PredictionMarketDAO.sol/PredictionMarketDAO.json"
-);
+const contracts = [
+  'PredictionMarketDAO',
+  'GovernanceToken'
+];
 
-// Đường dẫn file frontend muốn copy
-const destPath = path.join(
-  __dirname,
-  "../prediction-market-frontend/src/PredictionMarketDAO.json"
-);
+const abiDir = path.join(__dirname, '../frontend/src/abis');
 
-// Đọc artifact
-const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
+// Tạo folder nếu chưa có
+if (!fs.existsSync(abiDir)) {
+  fs.mkdirSync(abiDir, { recursive: true });
+}
 
-// Lấy chỉ phần ABI
-const abi = artifact.abi;
+contracts.forEach(contractName => {
+  const artifactPath = path.join(
+    __dirname,
+    `../artifacts/contracts/${contractName}.sol/${contractName}.json`
+  );
 
-// Ghi ra frontend
-fs.writeFileSync(destPath, JSON.stringify(abi, null, 2));
-
-console.log(`✅ ABI đã được copy vào ${destPath}`);
+  if (fs.existsSync(artifactPath)) {
+    const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+    const abiPath = path.join(abiDir, `${contractName}.json`);
+    
+    fs.writeFileSync(
+      abiPath,
+      JSON.stringify(artifact.abi, null, 2)
+    );
+    
+    console.log(`✅ Copied ${contractName} ABI to frontend/src/abis/`);
+  } else {
+    console.log(`❌ ${contractName} artifact not found. Run 'npx hardhat compile' first.`);
+  }
+});
