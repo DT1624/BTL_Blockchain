@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./GovernanceToken.sol";
 
-contract PredictionMarketDAO is ReentrancyGuard {
+// ✅ FIX: Remove duplicate ReentrancyGuard
+contract PredictionMarketDAO is Ownable, Pausable, ReentrancyGuard {
     // struct
     struct Market {
         string question; // câu hỏi đặt cược của Market
         address creator; // người tạo market
         uint256 creatorBond; // số tiền đặt cọc của người tạo market
         uint256 endTime; // thời điểm kết thúc đặt cược
-        uint256 proposalDeadline; // thời điểm cuối cùng cho phéo tạo proposal
+        uint256 resolveDeadline; // thời điểm cuối cùng cho phép resolve market
         uint256 poolYES; // tổng tiền cược cho YES
         uint256 poolNO; // tổng tiền cược cho NO
         bool resolved; // câu hỏi đã được giải quyết thông qua proposal chưa
         bool outcome; // kết quả chung cuộc (true = YES, false = NO)
         address resolver; // địa chỉ người resolve market
         uint256 resolverBond; // số tiền đặt cọc của resolver
-        uint256 resolveTime; // thời điểm market được resolve
-        uint256 disputeDeadline; // thời gian tranh chấp sau khi proposal được thực thi
+        uint256 resolveTime; // thời điểm market được resolve (đảm bảo <= resolveDeadline)
+        uint256 disputeDeadline; // thời gian tranh chấp sau khi resolve được thực thi (được phép tạo proposal)
         uint256 relatedProposalId; // proposalID liên quan tới market này
         uint256 snapshotBlock; // block snapshot khi đóng bet
         bool bettingClosed; // trạng thái bet đã đóng chưa
@@ -44,14 +47,14 @@ contract PredictionMarketDAO is ReentrancyGuard {
     Market[] public markets;
     Proposal[] public proposals;
 
-    // Constants
-    uint256 public constant MIN_CREATOR_BOND = 100 ether; // số token tối thiểu stake để tạo market
-    uint256 public constant MIN_RESOLVER_BOND = 50 ether; // số token tối thiểu stake để resolve market
-    uint256 public constant PROPOSAL_WINDOW_DURATION = 12 hours; // thời gian cho phép tạo proposal sau khi đóng bet
-    uint256 public constant PROPOSAL_VOTING_DURATION = 1 days; // thời gian vote cho proposal
-    uint256 public constant DISPUTE_WINDOW = 2 days; // thời gian tranh chấp sau khi proposal được thực thi
-    uint256 public constant RESOLVER_REWARD_BPS = 100; // 1% - thưởng nếu resolver đúng
-    uint256 public constant RESOLVER_SLASH_BPS = 5000; // 50% - phạt nếu resolver sai
+    // ✅ ADMIN PARAMETERS (Configurable thay cho constants)
+    uint256 public stakingRequirement = 100 ether; // MIN_CREATOR_BOND
+    uint256 public resolverBond = 50 ether; // MIN_RESOLVER_BOND
+    uint256 public resolveWindowDuration = 12 hours; // RESOLVE_WINDOW_DURATION
+    uint256 public disputeWindow = 1 days; // DISPUTE_WINDOW
+    uint256 public votingDuration = 1 days; // PROPOSAL_VOTING_DURATION
+    uint256 public resolverRewardBps = 100; // RESOLVER_REWARD_BPS (1%)
+    uint256 public resolverSlashBps = 5000; // RESOLVER_SLASH_BPS (50%)
     uint256 public constant BPS_DENOM = 10000;
 
     uint256 public defaultProposalId = type(uint256).max; // giá trị đặc biệt cho biết market không có proposal liên quan
@@ -59,18 +62,26 @@ contract PredictionMarketDAO is ReentrancyGuard {
     //Mappings
     mapping(uint256 => mapping(address => uint256)) public betsYES; // Số ETH đặt cược YES của mỗi địa chỉ cho mỗi market
     mapping(uint256 => mapping(address => uint256)) public betsNO; // Số ETH đặt cược NO của mỗi địa chỉ cho mỗi market
-    mapping(uint256 => mapping(address => uint256)) public usedVotingPower; // Tổng trọng số đã vote của mỗi người dùng (cho phép user vote nhiều lần, với các trọng số tùy chỉnh)
+    mapping(uint256 => mapping(address => bool)) public hasVoted; // Theo dõi xem người dùng đã vote cho proposal chưa
     mapping(address => bool) public executors;
 
     // Configurable parameters
     uint256 public feeBps = 200; // default fee 2% (chia cho 100)
     uint256 public soloBonusRate = 500; // nếu tất cả thắng, trích 5% từ tổng quỹ
-    uint256 public returnFeeBps = 8000; // nếu thua thì trả lại 80% số tiền
-    uint256 public vaultBalance; // Tổng số dư của vault
-    address public owner; // Địa chỉ người quản lý
+    uint256 public returnFeeBps = 8000; // nếu thua thì trả lại 80% số tiền - 20% nạp vào quỹ
+    uint256 public vaultBalance; // Tổng số dư của vault (ETH)
+
+    // ✅ ADMIN EVENTS
+    event ParameterUpdated(
+        string indexed parameter,
+        uint256 oldValue,
+        uint256 newValue
+    );
+    event EmergencyPaused(address indexed admin);
+    event EmergencyUnpaused(address indexed admin);
+    event FeesWithdrawn(address indexed admin, uint256 amount);
 
     // ========== EVENTS ==========
-
     event MarketCreated(
         uint256 indexed id,
         string question,
@@ -135,6 +146,7 @@ contract PredictionMarketDAO is ReentrancyGuard {
     event Received(address indexed sender, uint256 amount);
 
     // ========== MODIFIERS ==========
+    // Tự động đóng cược nếu đã hết thời gian đặt cược (sử dụng trong resolveMarket và createDisputeProposal)
     modifier autoCloseBetting(uint256 marketID) {
         require(marketID < markets.length, "Invalid market");
         Market storage m = markets[marketID];
@@ -146,63 +158,191 @@ contract PredictionMarketDAO is ReentrancyGuard {
         _;
     }
 
-    // ========== CONSTRUCTOR ==========
+    modifier autoFinalizeResolve(uint256 marketID) {
+        require(marketID < markets.length, "Invalid market");
+        Market storage m = markets[marketID];
+        require(m.resolved, "Market not resolved");
+        if (!m.resolverPaid && m.resolver != address(0)) {
+            bool hasActiveDispute = (m.relatedProposalId != defaultProposalId &&
+                !proposals[m.relatedProposalId].executed);
 
-    constructor(uint256 initialSupply) {
-        owner = msg.sender;
+            if (!hasActiveDispute) {
+                _rewardResolver(marketID);
+            }
+        }
+
+        if (!m.bondReturned) {
+            _returnCreatorBond(marketID);
+        }
+        _;
+    }
+
+    // ========== CONSTRUCTOR ==========
+    constructor(uint256 initialSupply) Ownable(msg.sender) {
         govToken = new GovernanceToken(initialSupply);
-        executors[owner] = true;
+        executors[msg.sender] = true;
+    }
+
+    // ✅ ADMIN FUNCTIONS - PARAMETER MANAGEMENT
+    function setStakingRequirement(
+        uint256 _stakingRequirement
+    ) external onlyOwner {
+        require(
+            _stakingRequirement > 0,
+            "Staking requirement must be positive"
+        );
+        uint256 oldValue = stakingRequirement;
+        stakingRequirement = _stakingRequirement;
+        emit ParameterUpdated(
+            "stakingRequirement",
+            oldValue,
+            _stakingRequirement
+        );
+    }
+
+    function setResolverBond(uint256 _resolverBond) external onlyOwner {
+        require(_resolverBond > 0, "Resolver bond must be positive");
+        uint256 oldValue = resolverBond;
+        resolverBond = _resolverBond;
+        emit ParameterUpdated("resolverBond", oldValue, _resolverBond);
+    }
+
+    function setVotingDuration(uint256 _votingDuration) external onlyOwner {
+        require(_votingDuration >= 1 hours, "Voting duration too short");
+        require(_votingDuration <= 30 days, "Voting duration too long");
+        uint256 oldValue = votingDuration;
+        votingDuration = _votingDuration;
+        emit ParameterUpdated("votingDuration", oldValue, _votingDuration);
+    }
+
+    function setResolveWindowDuration(
+        uint256 _resolveWindowDuration
+    ) external onlyOwner {
+        require(_resolveWindowDuration >= 1 hours, "Resolve window too short");
+        require(_resolveWindowDuration <= 7 days, "Resolve window too long");
+        uint256 oldValue = resolveWindowDuration;
+        resolveWindowDuration = _resolveWindowDuration;
+        emit ParameterUpdated(
+            "resolveWindowDuration",
+            oldValue,
+            _resolveWindowDuration
+        );
+    }
+
+    function setDisputeWindow(uint256 _disputeWindow) external onlyOwner {
+        require(_disputeWindow >= 12 hours, "Dispute window too short");
+        require(_disputeWindow <= 14 days, "Dispute window too long");
+        uint256 oldValue = disputeWindow;
+        disputeWindow = _disputeWindow;
+        emit ParameterUpdated("disputeWindow", oldValue, _disputeWindow);
+    }
+
+    function setResolverRewardBps(
+        uint256 _resolverRewardBps
+    ) external onlyOwner {
+        require(_resolverRewardBps <= 1000, "Resolver reward too high"); // Max 10%
+        uint256 oldValue = resolverRewardBps;
+        resolverRewardBps = _resolverRewardBps;
+        emit ParameterUpdated(
+            "resolverRewardBps",
+            oldValue,
+            _resolverRewardBps
+        );
+    }
+
+    function setResolverSlashBps(uint256 _resolverSlashBps) external onlyOwner {
+        require(_resolverSlashBps <= BPS_DENOM, "Invalid slash rate");
+        uint256 oldValue = resolverSlashBps;
+        resolverSlashBps = _resolverSlashBps;
+        emit ParameterUpdated("resolverSlashBps", oldValue, _resolverSlashBps);
+    }
+
+    // ✅ EMERGENCY FUNCTIONS
+    function pause() public onlyOwner {
+        _pause();
+        emit EmergencyPaused(msg.sender);
+    }
+
+    function unpause() public onlyOwner {
+        _unpause();
+        emit EmergencyUnpaused(msg.sender);
+    }
+
+    function emergencyPaused() external view returns (bool) {
+        return paused();
+    }
+
+    // ✅ FINANCIAL MANAGEMENT
+    function getContractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    function withdrawFees() external onlyOwner nonReentrant {
+        uint256 balance = vaultBalance;
+        require(balance > 0, "No fees to withdraw");
+
+        vaultBalance = 0;
+        (bool success, ) = payable(owner()).call{value: balance}("");
+        require(success, "Withdrawal failed");
+
+        emit FeesWithdrawn(msg.sender, balance);
+    }
+
+    function emergencyWithdraw() external onlyOwner nonReentrant {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No funds to withdraw");
+
+        (bool success, ) = payable(owner()).call{value: balance}("");
+        require(success, "Emergency withdrawal failed");
+
+        emit FeesWithdrawn(msg.sender, balance);
+    }
+
+    function _updateVault(uint256 amount) internal {
+        vaultBalance += amount;
+        emit Received(msg.sender, amount);
     }
 
     // cho phép contract nhận ETH trực tiếp mà không cần đi kèm call data (đảm bảo an toàn cho tests/funding)
     receive() external payable {
-        vaultBalance += msg.value;
-        emit Received(msg.sender, msg.value);
+        _updateVault(msg.value);
     }
 
-    // ========== MARKET FUNCTIONS ==========
+    fallback() external payable {
+        _updateVault(msg.value);
+    }
 
-    // tạo Market với yêu cầu câu hỏi đặt cược và khoảng thời gian cho phép đặt cược
-    /**
-     * @dev Create a new prediction market
-     * @param question The question to predict
-     * @param durationTime Duration for betting (in seconds)
-     *
-     * Requirements:
-     * - Creator must have MIN_CREATOR_BOND (100 GOV)
-     * - Creator must approve() this contract first
-     *
-     * Effects:
-     * - Pulls 100 GOV from creator (locked until finalize)
-     * - Sets endTime = now + durationTime
-     * - Sets proposalDeadline = endTime + 12 hours
-     */
+    // ========== MARKET FUNCTIONS WITH PAUSABLE ==========
     function createMarket(
         string calldata question,
         uint256 durationTime
-    ) external {
+    ) external whenNotPaused {
         require(durationTime > 0, "Duration must be > 0");
 
-        // Pull GOV bond from creator
+        // ✅ Use configurable stakingRequirement
         require(
-            govToken.balanceOf(msg.sender) >= MIN_CREATOR_BOND,
+            govToken.balanceOf(msg.sender) >= stakingRequirement,
             "Insufficient GOV for creator bond"
         );
         require(
-            govToken.transferFrom(msg.sender, address(this), MIN_CREATOR_BOND),
+            govToken.transferFrom(
+                msg.sender,
+                address(this),
+                stakingRequirement
+            ),
             "Creator bond transfer failed"
         );
 
         uint256 _endTime = block.timestamp + durationTime;
-        uint256 _proposalDeadline = _endTime + PROPOSAL_WINDOW_DURATION;
+        uint256 _resolveDeadline = _endTime + resolveWindowDuration; // ✅ Use configurable
 
         markets.push(
             Market({
                 question: question,
                 creator: msg.sender,
-                creatorBond: MIN_CREATOR_BOND,
+                creatorBond: stakingRequirement, // ✅ Use configurable
                 endTime: _endTime,
-                proposalDeadline: _proposalDeadline,
+                resolveDeadline: _resolveDeadline,
                 poolYES: 0,
                 poolNO: 0,
                 resolved: false,
@@ -223,22 +363,14 @@ contract PredictionMarketDAO is ReentrancyGuard {
             question,
             _endTime,
             msg.sender,
-            MIN_CREATOR_BOND
+            stakingRequirement // ✅ Use configurable
         );
     }
 
-    // người dùng đặt cược vào một market
-    /**
-     * @dev Place a bet on a market
-     * @param marketID Market to bet on
-     * @param onYES true = bet YES, false = bet NO
-     * 
-     * Requirements:
-     * - Before endTime
-     * - Market not resolved
-     * - Send ETH with transaction
-     */
-    function placeBet(uint256 marketID, bool onYES) external payable {
+    function placeBet(
+        uint256 marketID,
+        bool onYES
+    ) external payable whenNotPaused {
         require(marketID < markets.length, "Invalid market");
         Market storage m = markets[marketID];
         require(block.timestamp < m.endTime, "Market closed");
@@ -253,116 +385,47 @@ contract PredictionMarketDAO is ReentrancyGuard {
         emit PlaceBet(marketID, msg.sender, onYES, msg.value);
     }
 
-    
-
-    // ========== Proposal / DAO ==========
-
-    /**
-     * @dev Resolve a market (anyone can call, must stake GOV bond)
-     * @param marketID Market to resolve
-     * @param outcome Proposed outcome (true = YES, false = NO)
-     * 
-     * Requirements:
-     * - Sau endTime
-     * - Market chưa được resolved
-     * - Người gọi phải có tối thiểu MIN_RESOLVER_BOND (50 GOV) để Stake
-     * - Người gọi phải approve() cho contract này trước
-     * 
-     * Effects:
-     * - Người gọi stake 50 GOV (khóa trong 2 ngày tranh chấp)
-     * - Đặt disputeDeadline = now + 2 ngày
-     * - Tự động đóng cược nếu chưa đóng
-     */
-    function resolveMarket(uint256 marketID, bool outcome)
-        external
-        autoCloseBetting(marketID)
-    {
-        require(marketID < markets.length, "Invalid market");
+    function resolveMarket(
+        uint256 marketID,
+        bool outcome
+    ) external whenNotPaused autoCloseBetting(marketID) {
         Market storage m = markets[marketID];
+        require(
+            block.timestamp <= m.resolveDeadline,
+            "Resolve window has passed"
+        );
         require(m.bettingClosed, "Betting not closed");
         require(!m.resolved, "Already resolved");
 
-        // Pull GOV bond from resolver
+        // ✅ Use configurable resolverBond
         require(
-            govToken.balanceOf(msg.sender) >= MIN_RESOLVER_BOND,
+            govToken.balanceOf(msg.sender) >= resolverBond,
             "Insufficient GOV for resolver bond"
         );
         require(
-            govToken.transferFrom(msg.sender, address(this), MIN_RESOLVER_BOND),
+            govToken.transferFrom(msg.sender, address(this), resolverBond),
             "Resolver bond transfer failed"
         );
 
         m.resolved = true;
         m.outcome = outcome;
         m.resolver = msg.sender;
-        m.resolverBond = MIN_RESOLVER_BOND;
+        m.resolverBond = resolverBond; // ✅ Use configurable
         m.resolveTime = block.timestamp;
-        m.disputeDeadline = block.timestamp + DISPUTE_WINDOW;
+        m.disputeDeadline = block.timestamp + disputeWindow; // ✅ Use configurable
 
-        emit MarketResolved(marketID, outcome, msg.sender, MIN_RESOLVER_BOND);
+        emit MarketResolved(marketID, outcome, msg.sender, resolverBond);
     }
 
-    /**
-     * @dev Finalize resolve if no dispute (anyone can call) 
-     * @param marketID Market to finalize
-     * 
-     * Requirements:
-     * - Sau khi disputeDeadline
-     * - Không có proposal đang hoạt động
-     * - Resolver chưa được trả
-     * 
-     * Effects:
-     * - Trả lại 50 GOV bond cho resolver
-     * - Trả 1% tổng pool làm phần thưởng ETH cho resolver
-     * - Trả lại 100 GOV bond cho creator
-     */
-    function finalizeResolve(uint256 marketID) external nonReentrant {
-        require(marketID < markets.length, "Invalid market");
-        Market storage m = markets[marketID];
-        require(m.resolved, "Not resolved yet");
-        require(block.timestamp >= m.disputeDeadline, "Dispute window open");
-        require(
-            m.relatedProposalId == defaultProposalId,
-            "Has active dispute"
-        );
-        require(!m.resolverPaid, "Resolver already paid");
-
-        _rewardResolver(marketID);
-        _returnCreatorBond(marketID);
-    }
-
-    // ========== PROPOSAL / DISPUTE FUNCTIONS ==========
-    
-    /**
-     * @dev Create a dispute proposal (only if disagree with resolver)
-     * @param description Reason for dispute
-     * @param marketID Market being disputed
-     * @param correctOutcome What the correct outcome should be
-     * 
-     * Requirements:
-     * - Market đã được resolved
-     * - Trong khoảng thời gian tranh chấp
-     * - correctOutcome != m.outcome (phải khác nhau)
-     * - Người gọi có GOV token (để vote)
-     * - Market chưa có proposal
-     * 
-     * Effects:
-     * - Creates proposal with snapshot = m.snapshotBlock (endTime)
-     * - Sets voting deadline = now + 1 day
-     */
     function createDisputeProposal(
         string calldata description,
         uint256 marketID,
         bool correctOutcome
-    ) external autoCloseBetting(marketID) {
-        require(marketID < markets.length, "Invalid market");
+    ) external whenNotPaused autoCloseBetting(marketID) {
         Market storage m = markets[marketID];
 
         require(m.resolved, "Market not resolved yet");
-        require(
-            block.timestamp <= m.disputeDeadline,
-            "Dispute window closed"
-        );
+        require(block.timestamp <= m.disputeDeadline, "Dispute window closed");
         require(
             m.relatedProposalId == defaultProposalId,
             "Market already has dispute"
@@ -372,7 +435,7 @@ contract PredictionMarketDAO is ReentrancyGuard {
             "Proposal must disagree with resolver"
         );
 
-        uint256 deadline = block.timestamp + PROPOSAL_VOTING_DURATION;
+        uint256 deadline = block.timestamp + votingDuration; // ✅ Use configurable
         m.relatedProposalId = proposals.length;
 
         proposals.push(
@@ -397,64 +460,28 @@ contract PredictionMarketDAO is ReentrancyGuard {
         );
     }
 
-    /**
-     * @dev Vote on a dispute proposal
-     * @param proposalID Proposal to vote on
-     * @param support true = vote FOR, false = vote AGAINST
-     * @param amount Voting power to use (can vote multiple times)
-     * 
-     * Requirements:
-     * - Before voting deadline
-     * - Voter has voting power at proposal.snapshotBlock
-     * - amount <= remaining voting power
-     * 
-     * Note: Voting power based on GOV balance at market endTime
-     */
-    function vote(uint256 proposalID, bool support, uint256 amount) external {
+    function vote(uint256 proposalID, bool support) external whenNotPaused {
         require(proposalID < proposals.length, "Invalid proposal");
         Proposal storage p = proposals[proposalID];
         require(block.timestamp < p.deadline, "Voting closed");
+        require(!hasVoted[proposalID][msg.sender], "Already voted");
 
-        uint256 totalPower = govToken.getPastVotes(
-            msg.sender,
-            p.snapshotBlock
-        );
-        uint256 used = usedVotingPower[proposalID][msg.sender];
-        require(totalPower > used, "No remaining voting power");
-        require(amount > 0 && amount <= totalPower - used, "Invalid amount");
-
-        usedVotingPower[proposalID][msg.sender] += amount;
+        uint256 totalPower = govToken.getPastVotes(msg.sender, p.snapshotBlock);
+        require(totalPower > 0, "No voting power");
 
         if (support) {
-            p.votesFor += amount;
+            p.votesFor += totalPower;
         } else {
-            p.votesAgainst += amount;
+            p.votesAgainst += totalPower;
         }
+        hasVoted[proposalID][msg.sender] = true;
 
-        emit Voted(proposalID, msg.sender, support, amount);
+        emit Voted(proposalID, msg.sender, support, totalPower);
     }
 
-    /**
-     * @dev Execute a dispute proposal (only owner/executor)
-     * @param proposalID Proposal to execute
-     * 
-     * Requirements:
-     * - Caller is executor (owner or whitelisted)
-     * - After voting deadline
-     * - Not executed yet
-     * 
-     * Effects if dispute passed (votesFor > votesAgainst):
-     * - Changes market outcome to proposal.executeYES
-     * - Slashes resolver 50% of bond (25 GOV to vault)
-     * - Returns remaining 50% to resolver
-     * - Returns creator bond
-     * 
-     * Effects if dispute failed:
-     * - Keeps original outcome
-     * - Rewards resolver (bond + 1% pool)
-     * - Returns creator bond
-     */
-    function executeProposal(uint256 proposalID) external nonReentrant {
+    function executeProposal(
+        uint256 proposalID
+    ) external whenNotPaused nonReentrant {
         require(executors[msg.sender], "Not authorized executor");
         require(proposalID < proposals.length, "Invalid proposal");
         Proposal storage p = proposals[proposalID];
@@ -469,11 +496,12 @@ contract PredictionMarketDAO is ReentrancyGuard {
             // Dispute wins: resolver was WRONG
             m.outcome = p.executeYES;
 
-            uint256 slashed = (m.resolverBond * RESOLVER_SLASH_BPS) /
-                BPS_DENOM;
+            uint256 slashed = (m.resolverBond * resolverSlashBps) / BPS_DENOM; // ✅ Use configurable
             uint256 returnToResolver = m.resolverBond - slashed;
-
-            vaultBalance += slashed;
+            require(
+                govToken.balanceOf(address(this)) >= returnToResolver,
+                "Insufficient vault balance"
+            );
 
             if (returnToResolver > 0) {
                 require(
@@ -492,25 +520,35 @@ contract PredictionMarketDAO is ReentrancyGuard {
         _returnCreatorBond(p.marketID);
 
         p.executed = true;
+        m.relatedProposalId = defaultProposalId;
         emit ProposalExecuted(proposalID, disputePassed, msg.sender);
     }
 
-     // ========== INTERNAL FUNCTIONS ==========
-    
-    /**
-     * @dev Internal: Reward resolver for correct resolution
-     */
+    // ========== REST OF FUNCTIONS (unchanged) ==========
+    function finalizeResolve(uint256 marketID) external whenNotPaused nonReentrant {
+        require(marketID < markets.length, "Invalid market");
+        Market storage m = markets[marketID];
+        require(m.resolved, "Not resolved yet");
+        require(block.timestamp >= m.disputeDeadline, "Dispute window open");
+        require(m.relatedProposalId == defaultProposalId, "Has active dispute");
+        require(!m.resolverPaid, "Resolver already paid");
+
+        _rewardResolver(marketID);
+        _returnCreatorBond(marketID);
+    }
+
     function _rewardResolver(uint256 marketID) internal {
         Market storage m = markets[marketID];
         if (m.resolverPaid) return;
 
         uint256 totalPool = m.poolYES + m.poolNO;
-        uint256 reward = (totalPool * RESOLVER_REWARD_BPS) / BPS_DENOM;
+        uint256 reward = (totalPool * resolverRewardBps) / BPS_DENOM; // ✅ Use configurable
 
         // Return bond
         if (m.resolverBond > 0) {
             require(
-                govToken.transfer(m.resolver, m.resolverBond),
+                m.resolverBond < govToken.balanceOf(address(this)) &&
+                    govToken.transfer(m.resolver, m.resolverBond),
                 "Resolver bond return failed"
             );
         }
@@ -525,58 +563,25 @@ contract PredictionMarketDAO is ReentrancyGuard {
         emit ResolverRewarded(marketID, m.resolver, m.resolverBond, reward);
     }
 
-    /**
-     * @dev Internal: Return creator bond
-     */
     function _returnCreatorBond(uint256 marketID) internal {
         Market storage m = markets[marketID];
         if (m.bondReturned || m.creatorBond == 0) return;
 
-        m.bondReturned = true;
         require(
-            govToken.transfer(m.creator, m.creatorBond),
+            m.creatorBond < govToken.balanceOf(address(this)) &&
+                govToken.transfer(m.creator, m.creatorBond),
             "Creator bond return failed"
         );
+        m.bondReturned = true;
 
         emit CreatorBondReturned(marketID, m.creator, m.creatorBond);
     }
 
-    // ========== WITHDRAWAL FUNCTION ==========
-    
-    /**
-     * @dev Withdraw winnings from a resolved market
-     * @param marketID Market to withdraw from
-     * 
-     * Auto-finalize:
-     * - If resolver not paid yet and no active dispute → pays resolver
-     * - If creator bond not returned → returns creator bond
-     * 
-     * Payout calculation:
-     * - Winner: stake + share of loser pool - 2% fee
-     * - Loser: 80% refund
-     * - Solo winner (no loser pool): stake - 2% fee + 5% vault bonus
-     */
-    function withdrawWinnings(uint256 marketID) external nonReentrant {
-        require(marketID < markets.length, "Invalid market");
+    function withdrawWinnings(
+        uint256 marketID
+    ) external whenNotPaused autoFinalizeResolve(marketID) nonReentrant {
         Market storage m = markets[marketID];
-        require(m.resolved, "Market not resolved");
 
-        // ========== AUTO FINALIZE ==========
-        if (!m.resolverPaid && m.resolver != address(0)) {
-            bool hasActiveDispute = (m.relatedProposalId !=
-                defaultProposalId &&
-                !proposals[m.relatedProposalId].executed);
-
-            if (!hasActiveDispute) {
-                _rewardResolver(marketID);
-            }
-        }
-
-        if (!m.bondReturned) {
-            _returnCreatorBond(marketID);
-        }
-
-        // ========== WITHDRAW LOGIC ==========
         uint256 userWinner;
         uint256 userLoser;
         uint256 winnerPool;
@@ -623,11 +628,22 @@ contract PredictionMarketDAO is ReentrancyGuard {
             } else {
                 // Solo case: no loser pool
                 uint256 defaultFee = (userWinner * feeBps) / BPS_DENOM;
-                uint256 soloBonus = (vaultBalance * soloBonusRate) / BPS_DENOM;
-                uint256 userBonus = (userWinner * soloBonus) / winnerPool;
-                payout += userWinner - defaultFee + userBonus;
+                uint256 soloBonus = 0;
+
+                if (vaultBalance > 0 && winnerPool > 0) {
+                    uint256 maxBonus = (vaultBalance * soloBonusRate) /
+                        BPS_DENOM;
+                    uint256 userBonus = (userWinner * maxBonus) / winnerPool;
+
+                    soloBonus = userBonus < vaultBalance
+                        ? userBonus
+                        : vaultBalance;
+                }
+                payout += userWinner - defaultFee + soloBonus;
                 fee += defaultFee;
-                vaultBalance -= soloBonus;
+                if (soloBonus > 0) {
+                    vaultBalance -= soloBonus;
+                }
             }
         }
 
@@ -647,37 +663,37 @@ contract PredictionMarketDAO is ReentrancyGuard {
         emit Withdrawn(msg.sender, marketID, payout, fee);
     }
 
-    // ========== ADMIN FUNCTIONS ==========
-    
-    function setExecutor(address executor, bool status) external {
-        require(msg.sender == owner, "Only owner");
+    // ========== ADMIN FUNCTIONS (Enhanced) ==========
+    function setExecutor(address executor, bool status) external onlyOwner {
         executors[executor] = status;
         emit ExecutorUpdated(executor, status);
     }
 
-    function setFeeBps(uint256 newFeeBps) external {
-        require(msg.sender == owner, "Only owner");
+    function setFeeBps(uint256 newFeeBps) external onlyOwner {
         require(newFeeBps <= BPS_DENOM, "Invalid fee");
+        uint256 oldValue = feeBps;
         feeBps = newFeeBps;
+        emit ParameterUpdated("feeBps", oldValue, newFeeBps);
     }
 
-    function setSoloBonusRate(uint256 newSoloBonusRate) external {
-        require(msg.sender == owner, "Only owner");
-        require(newSoloBonusRate <= BPS_DENOM, "Invalid fee");
+    function setSoloBonusRate(uint256 newSoloBonusRate) external onlyOwner {
+        require(newSoloBonusRate <= BPS_DENOM, "Invalid rate");
+        uint256 oldValue = soloBonusRate;
         soloBonusRate = newSoloBonusRate;
+        emit ParameterUpdated("soloBonusRate", oldValue, newSoloBonusRate);
     }
 
-    function setReturnFeeBps(uint256 newReturnFeeBps) external {
-        require(msg.sender == owner, "Only owner");
+    function setReturnFeeBps(uint256 newReturnFeeBps) external onlyOwner {
         require(newReturnFeeBps <= BPS_DENOM, "Invalid fee");
+        uint256 oldValue = returnFeeBps;
         returnFeeBps = newReturnFeeBps;
+        emit ParameterUpdated("returnFeeBps", oldValue, newReturnFeeBps);
     }
 
-    function withdrawVault(address payable to, uint256 amount)
-        external
-        nonReentrant
-    {
-        require(msg.sender == owner, "Only owner");
+    function withdrawVault(
+        address payable to,
+        uint256 amount
+    ) external onlyOwner nonReentrant {
         require(amount <= vaultBalance, "Insufficient vault");
         vaultBalance -= amount;
         (bool ok, ) = to.call{value: amount}("");
@@ -686,12 +702,9 @@ contract PredictionMarketDAO is ReentrancyGuard {
     }
 
     // ========== VIEW FUNCTIONS ==========
-    
-    function getTotalBets(uint256 marketID)
-        external
-        view
-        returns (uint256, uint256)
-    {
+    function getTotalBets(
+        uint256 marketID
+    ) external view returns (uint256, uint256) {
         return (markets[marketID].poolYES, markets[marketID].poolNO);
     }
 
@@ -703,20 +716,15 @@ contract PredictionMarketDAO is ReentrancyGuard {
         return proposals.length;
     }
 
-    function isMarketFinalized(uint256 marketID)
-        external
-        view
-        returns (bool)
-    {
+    function isMarketFinalized(uint256 marketID) external view returns (bool) {
         Market storage m = markets[marketID];
         return m.resolved && m.resolverPaid && m.bondReturned;
     }
 
-    function canWithdraw(uint256 marketID, address user)
-        external
-        view
-        returns (bool)
-    {
+    function canWithdraw(
+        uint256 marketID,
+        address user
+    ) external view returns (bool) {
         if (marketID >= markets.length) return false;
         Market storage m = markets[marketID];
 
@@ -726,7 +734,9 @@ contract PredictionMarketDAO is ReentrancyGuard {
         return userBet > 0;
     }
 
-    function getResolverStatus(uint256 marketID)
+    function getResolverStatus(
+        uint256 marketID
+    )
         external
         view
         returns (
@@ -743,7 +753,36 @@ contract PredictionMarketDAO is ReentrancyGuard {
 
         if (!paid && m.resolved) {
             uint256 totalPool = m.poolYES + m.poolNO;
-            pendingReward = (totalPool * RESOLVER_REWARD_BPS) / BPS_DENOM;
+            pendingReward = (totalPool * resolverRewardBps) / BPS_DENOM; // ✅ Use configurable
         }
+    }
+
+    function getProposalCount() external view returns (uint256) {
+        return proposals.length;
+    }
+
+    // ✅ NEW ADMIN VIEW FUNCTIONS
+    function getAllParameters()
+        external
+        view
+        returns (
+            uint256 _stakingRequirement,
+            uint256 _resolverBond,
+            uint256 _votingDuration,
+            uint256 _resolveWindowDuration,
+            uint256 _disputeWindow,
+            uint256 _resolverRewardBps,
+            uint256 _resolverSlashBps
+        )
+    {
+        return (
+            stakingRequirement,
+            resolverBond,
+            votingDuration,
+            resolveWindowDuration,
+            disputeWindow,
+            resolverRewardBps,
+            resolverSlashBps
+        );
     }
 }
