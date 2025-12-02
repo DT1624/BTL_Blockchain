@@ -36,6 +36,11 @@ function TabMarkets({ daoContract, govTokenContract, account, onBalanceChange })
           myBetNO: ethers.formatEther(myBetNO),
           poolYES: ethers.formatEther(market.poolYES),
           poolNO: ethers.formatEther(market.poolNO),
+          resolveDeadline: Number(market.resolveDeadline),
+          relatedProposalID: Number(market.relatedProposalId),
+          disputeDeadline: Number(market.disputeDeadline),
+          bondReturned: market.bondReturned,
+          resolverPaid: market.resolverPaid,
         });
       }
 

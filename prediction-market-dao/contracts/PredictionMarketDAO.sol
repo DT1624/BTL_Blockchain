@@ -208,8 +208,8 @@ contract PredictionMarketDAO is Ownable, Pausable, ReentrancyGuard {
     }
 
     function setVotingDuration(uint256 _votingDuration) external onlyOwner {
-        require(_votingDuration >= 1 hours, "Voting duration too short");
-        require(_votingDuration <= 30 days, "Voting duration too long");
+        require(_votingDuration >= 1 minutes, "Voting duration too short");
+        require(_votingDuration <= 10 days, "Voting duration too long");
         uint256 oldValue = votingDuration;
         votingDuration = _votingDuration;
         emit ParameterUpdated("votingDuration", oldValue, _votingDuration);

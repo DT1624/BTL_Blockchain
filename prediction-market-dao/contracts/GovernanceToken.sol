@@ -15,7 +15,7 @@ contract GovernanceToken is
     ReentrancyGuard
 {
     // Rate & fee
-    uint256 public rate = 1000; // tokens per 1 ETH
+    uint256 public rate = 100; // tokens per 1 ETH
     address public feeRecipient;
     uint16 public buyFeeBps; // fee khi mua, thu bằng token (basis points, 10000 = 100%)
     uint16 public sellFeeBps; // fee khi bán, thu bằng ETH

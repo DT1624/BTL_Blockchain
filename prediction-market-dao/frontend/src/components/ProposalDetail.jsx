@@ -4,11 +4,11 @@ import dayjs from 'dayjs';
 
 function ProposalDetail({ proposal, market, daoContract, govTokenContract, account, onClose, onUpdate }) {
   const [voteSupport, setVoteSupport] = useState(true);
-  const [voteAmount, setVoteAmount] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [loadingType, setLoadingType] = useState('');
   const [myVotingPower, setMyVotingPower] = useState('0');
-  const [remainingPower, setRemainingPower] = useState('0');
+  const [hasVoted, setHasVoted] = useState(false);
+  // const [remainingPower, setRemainingPower] = useState('0');
 
   const now = Date.now() / 1000;
   const canVote = now < proposal.deadline && !proposal.executed;
@@ -24,36 +24,32 @@ function ProposalDetail({ proposal, market, daoContract, govTokenContract, accou
       const snapshotBlock = marketData.snapshotBlock;
 
       const totalPower = await govTokenContract.getPastVotes(account, snapshotBlock);
-      const usedPower = await daoContract.usedVotingPower(proposal.id, account);
-
+      const voted = await daoContract.hasVoted(proposal.id, account);
       setMyVotingPower(ethers.formatEther(totalPower));
-      setRemainingPower(ethers.formatEther(totalPower - usedPower));
+      setHasVoted(voted);
     } catch (error) {
       console.error('Load voting power error:', error);
     }
   };
 
   const handleVote = async () => {
-    if (!voteAmount || parseFloat(voteAmount) <= 0) {
-      alert('Please enter valid vote amount');
+    if (parseFloat(myVotingPower) === 0) {
+      alert('You have no voting power for this proposal');
       return;
     }
-
-    if (parseFloat(voteAmount) > parseFloat(remainingPower)) {
-      alert('Insufficient voting power');
+    if (hasVoted) {
+      alert('You have already voted on this proposal');
       return;
     }
 
     try {
       setIsLoading(true);
       setLoadingType('vote');
-      const amount = ethers.parseEther(voteAmount);
 
-      const tx = await daoContract.vote(proposal.id, voteSupport, amount);
+      const tx = await daoContract.vote(proposal.id, voteSupport);
       await tx.wait();
 
       alert('Vote submitted successfully!');
-      setVoteAmount('');
       loadVotingPower();
       onUpdate();
     } catch (error) {
@@ -182,13 +178,12 @@ function ProposalDetail({ proposal, market, daoContract, govTokenContract, accou
 
             <div className="my-voting-power">
               <p>💪 My Voting Power: {parseFloat(myVotingPower).toFixed(2)} GOV</p>
-              <p>✅ Remaining Power: {parseFloat(remainingPower).toFixed(2)} GOV</p>
-              <p>📝 Already Used: {parseFloat(proposal.myVotePower).toFixed(2)} GOV</p>
+              <p>📝 Already Voted: {hasVoted ? 'Yes' : 'No'}</p>
             </div>
           </div>
 
           {/* VOTE SECTION */}
-          {canVote && parseFloat(remainingPower) > 0 && (
+          {canVote && !hasVoted && (
             <div className="action-section vote-section">
               <h4>🗳️ Cast Your Vote</h4>
               
@@ -207,24 +202,10 @@ function ProposalDetail({ proposal, market, daoContract, govTokenContract, accou
                 </button>
               </div>
 
-              <div className="input-group">
-                <label>Voting Power (GOV):</label>
-                <input
-                  type="number"
-                  step="1"
-                  placeholder="0"
-                  max={remainingPower}
-                  value={voteAmount}
-                  onChange={(e) => setVoteAmount(e.target.value)}
-                  disabled={isLoading}
-                />
-                <small>Max: {parseFloat(remainingPower).toFixed(2)} GOV</small>
-              </div>
-
               <button
                 className={`btn-success ${isLoading && loadingType === 'vote' ? 'loading' : ''}`}
                 onClick={handleVote}
-                disabled={isLoading || !voteAmount}
+                disabled={isLoading}
               >
                 {isLoading && loadingType === 'vote' ? '' : `Vote ${voteSupport ? 'FOR' : 'AGAINST'}`}
               </button>
@@ -232,9 +213,9 @@ function ProposalDetail({ proposal, market, daoContract, govTokenContract, accou
           )}
 
           {/* NO VOTING POWER */}
-          {canVote && parseFloat(remainingPower) === 0 && (
+          {canVote && hasVoted && (
             <div className="info-box warning">
-              <p>⚠️ You have no remaining voting power for this proposal.</p>
+              <p>⚠️ You have voted.</p>
               {parseFloat(myVotingPower) === 0 && (
                 <p>You didn't hold GOV tokens at the snapshot block.</p>
               )}

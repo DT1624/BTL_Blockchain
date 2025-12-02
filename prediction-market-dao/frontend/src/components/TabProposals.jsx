@@ -27,13 +27,15 @@ function TabProposals({ daoContract, govTokenContract, account }) {
       while (true) {
         try {
           const proposal = await daoContract.proposals(proposalId);
+          // console.log(`- Fetched proposal ${proposalId}:`, proposal);
           
           if (proposal.deadline.toString() === '0') {
             break;
           }
 
-          const myVote = await daoContract.usedVotingPower(proposalId, account);
-
+          // const myVote = await daoContract.usedVotingPower(proposalId, account);
+          const myVote = await govTokenContract.getPastVotes(account, proposal.snapshotBlock);
+          // console.log(`  My vote power for proposal ${proposalId}:`, ethers.formatEther(myVote));
           proposalsData.push({
             id: proposalId,
             description: proposal.description,
@@ -52,7 +54,7 @@ function TabProposals({ daoContract, govTokenContract, account }) {
           break;
         }
       }
-
+      console.log(proposalsData)
       console.log(`✅ Loaded ${proposalsData.length} proposals:`, proposalsData);
       setProposals(proposalsData);
     } catch (error) {

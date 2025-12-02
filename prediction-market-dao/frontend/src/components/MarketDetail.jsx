@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 import dayjs from 'dayjs';
+import { MaxUint256 } from "ethers";
 
 
 function MarketDetail({ market, daoContract, govTokenContract, account, onClose, onUpdate }) {
@@ -11,8 +12,12 @@ function MarketDetail({ market, daoContract, govTokenContract, account, onClose,
 
   const MIN_RESOLVER_BOND = ethers.parseEther('50');
   const now = Date.now() / 1000;
+  // khi chưa hết thời gian đặt cược và thị trường chưa đóng cược
   const canBet = now < market.endTime && !market.bettingClosed;
-  const canResolve = now >= market.endTime && !market.resolved;
+  // khi hết hạn thị trường nhưng chưa quá hạn tranh chấp và thị trường chưa được giải quyết
+  const canResolve = now >= market.endTime && now < market.resolveDeadline && !market.resolved;
+  console.log('MarketDetail - canResolve:', canResolve);
+  console.log('MarketDetail - market:', now, market.endTime, market.resolveDeadline, market.resolved);
   const canWithdraw = market.resolved;
 
   // Place Bet
@@ -80,6 +85,23 @@ function MarketDetail({ market, daoContract, govTokenContract, account, onClose,
 
   // Withdraw Winnings
   const handleWithdraw = async () => {
+    console.log(now);
+    if(market.relatedProposalID != MaxUint256.toString()) {
+      // console.log('Market has related proposal ID:', market.relatedProposalID);
+      const proposal = await daoContract.proposals(market.relatedProposalID);
+      // console.log('Related  proposal:', proposal);
+      if(now < proposal.deadline && !proposal.executed) {
+        alert('Cannot withdraw winnings while there is an active dispute proposal on this market');
+        return;
+      }
+    } else {
+      console.log(market.disputeDeadline);
+      if(now < market.disputeDeadline) {
+        alert('Cannot withdraw winnings before dispute deadline');
+        return;
+      }
+    } 
+    
     if (parseFloat(market.myBetYES) === 0 && parseFloat(market.myBetNO) === 0) {
       alert('You have no bets in this market');
       return;
